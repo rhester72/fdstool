@@ -16,6 +16,8 @@
 // Are there other country codes? (4F, FF) - 00 is probably just 'unspecified' (as are several other unknowns?)
 // What is a file kind of 0x10?
 
+#define VERSION "0.1 beta"
+
 #define QD 1
 #define FDS 2
 
@@ -30,6 +32,7 @@ void bailout() {
 }
 
 void usage(char *progname) {
+	printf("fdstool %s\n\n", VERSION);
 	printf("Usage: %s [opts] infile <outfile>\n\n", progname);
 	printf("       -a: Add FDS header (converts from FDS to FDS)\n");
 	printf("       -h: Help\n");
