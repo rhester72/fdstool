@@ -113,7 +113,7 @@ void print_date(uint8_t *date) {
 			printf("<unknown>\n");
 			return;
 		}
-    	printf("%d, ", hextoint(date[2]));
+		printf("%d, ", hextoint(date[2]));
 		year = hextoint(date[0]);
 		if (year < 83)
 			year += 1925;
@@ -132,9 +132,9 @@ int main(int argc, char **argv) {
 	const uint8_t fds_header[17] = "FDS\x1a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 	const uint8_t bios_string[16] = "\x01*NINTENDO-HVC*";
 
-	for (x = 1; x<argc; x++) {
+	for (x = 1; x < argc; x++) {
 		if (strncmp(argv[x], "-", 1) == 0)
-			for (unsigned int y = 1; y<strlen(argv[x]); y++) {
+			for (unsigned int y = 1; y < strlen(argv[x]); y++) {
 				switch (argv[x][y]) {
 				case 'a':
 					append_header = 1;
@@ -201,10 +201,11 @@ int main(int argc, char **argv) {
 		bailout();
 	}
 
-	if (source == QD || append_header || remove_header)
-		dest = FDS;
-	else
-		dest = QD;
+	if (outfile)
+		if (source == QD || append_header || remove_header)
+			dest = FDS;
+		else
+			dest = QD;
 
 	if (dest == FDS && dib_zero) {
 		printf("FATAL: cannot zero dib crc for fds outfile\n");
@@ -260,7 +261,8 @@ int main(int argc, char **argv) {
 					printf("Copying header\n");
 				fwrite(buffer, 16, 1, fout);
 			}
-		} else {
+		}
+		else {
 			// assume no FDS header
 			rewind(fin);
 			if (verbose)
@@ -293,7 +295,6 @@ int main(int argc, char **argv) {
 			fwrite(buffer, 56, 1, fout);
 			total_write = 56;
 		}
-
 		if (source == QD) {
 			if (!fread(crc_buffer, 2, 1, fin)) {
 				printf("FATAL: fread failure for block 1 crc\n");
@@ -453,7 +454,7 @@ int main(int argc, char **argv) {
 			}
 			printf("\n");
 			printf("  Game name: ");
-			for (x = 0; x<3; x++) {
+			for (x = 0; x < 3; x++) {
 				if (buffer[16 + x] < 0x20 || buffer[16 + x] > 0x7E)
 					printf("?");
 				else
@@ -637,7 +638,7 @@ int main(int argc, char **argv) {
 				printf("\n");
 				printf("    File indicate code: %d\n", buffer[2]);
 				printf("    File name: ");
-				for (x = 0; x<3; x++) {
+				for (x = 0; x < 3; x++) {
 					if (buffer[3 + x] < 0x20 || buffer[3 + x] > 0x7E)
 						printf("?");
 					else
@@ -706,7 +707,7 @@ int main(int argc, char **argv) {
 				bailout();
 			}
 			if (dest) {
-				for (x = 0; x<65500 - total_write; x++)
+				for (x = 0; x < 65500 - total_write; x++)
 					fputc(0, fout);
 				if (!remove_header && !header_sides) {
 					fseek(fout, 4L, SEEK_SET);
@@ -720,11 +721,11 @@ int main(int argc, char **argv) {
 				bailout();
 			}
 			if (dest)
-				if(dest == QD)
-				    for (x = 0; x<65536 - total_write; x++)
-					    fputc(0, fout);
+				if (dest == QD)
+					for (x = 0; x < 65536 - total_write; x++)
+						fputc(0, fout);
 				else
-					for (x = 0; x<65500 - total_write; x++)
+					for (x = 0; x < 65500 - total_write; x++)
 						fputc(0, fout);
 		}
 	}
