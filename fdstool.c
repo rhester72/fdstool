@@ -1,25 +1,22 @@
-#include <ctype.h>
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
-#include <stdbool.h>
 
 // fdstool - FDS (Famicom Disk System) and QD (QuickDisk) image converter and analyzer
 // Heavily inspired by and sourced from https://wiki.nesdev.com/w/index.php/Family_Computer_Disk_System
 
-// TODO
-// Determine why one CRC mismatches in Nintendo dump
-// Find more pricing data (see pricing section)
-// Am I handling "Boot read file code" correctly?
-// Are there other game types? (00, FF, 46, 31, 44, 4B, 49)
-// Are there other country codes? (4F, FF) - 00 is probably just 'unspecified' (as are several other unknowns?)
-// What is a file kind of 0x10?
+// BUG: SMB: The Lost Levels (i.e. SMB2) overflows on CRC check:
+//      WARNING: CRC mismatch at offset 0x3C, read 0x0000, expected 0x14B31400
 
-#define VERSION "0.1 beta"
+// TODO: Allow null values for all QD checksums (Wii VC format)
+
+#define VERSION "0.2 beta"
 
 #define QD 1
 #define FDS 2
+#define QD_LENGTH 65536
+#define FDS_LENGTH 65500
 
 FILE *fin, *fout;
 
@@ -31,10 +28,11 @@ void bailout() {
 	exit(2);
 }
 
-void usage(char *progname) {
+void usage(char *prog_name) {
 	printf("fdstool %s\n\n", VERSION);
-	printf("Usage: %s [opts] infile <outfile>\n\n", progname);
+	printf("Usage: %s [opts] infile <outfile>\n\n", prog_name);
 	printf("       -a: Add FDS header (converts from FDS to FDS)\n");
+	printf("       -c: Recalculate/correct QD CRCs\n");
 	printf("       -h: Help\n");
 	printf("       -o: Overwrite outfile if it exists\n");
 	printf("       -r: Remove FDS header (from FDS outfile)\n");
@@ -51,8 +49,8 @@ uint16_t gen_qd_crc(uint8_t* data, unsigned size) {
 	for (unsigned byte_index = 0; byte_index < size + 2; byte_index++) {
 		uint8_t byte = byte_index < size ? data[byte_index] : 0x00;
 		for (unsigned bit_index = 0; bit_index < 8; bit_index++) {
-			bool bit = (byte >> bit_index) & 1;
-			bool carry = sum & 1;
+			unsigned short bit = (byte >> bit_index) & 1;
+			unsigned short carry = sum & 1;
 			sum = (sum >> 1) | (bit << 15);
 			if (carry) sum ^= 0x8408;
 		}
@@ -60,14 +58,12 @@ uint16_t gen_qd_crc(uint8_t* data, unsigned size) {
 	return sum;
 }
 
-unsigned int hextoint(uint8_t hex) {
-	char local_int[3];
-	sprintf(local_int, "%x", hex);
-	return atoi(local_int);
+unsigned short bcdtoint(unsigned char x) {
+	return x - 6 * (x >> 4);
 }
 
-void print_date(uint8_t *date) {
-	int year;
+void print_date(unsigned char *date) {
+	unsigned short year;
 
 	if (date[0] == 0x00 || date[0] == 0xFF)
 		printf("<unknown>\n");
@@ -113,8 +109,8 @@ void print_date(uint8_t *date) {
 			printf("<unknown>\n");
 			return;
 		}
-		printf("%d, ", hextoint(date[2]));
-		year = hextoint(date[0]);
+		printf("%x, ", date[2]);
+		year = bcdtoint(date[0]);
 		if (year < 83)
 			year += 1925;
 		else
@@ -124,29 +120,35 @@ void print_date(uint8_t *date) {
 }
 
 int main(int argc, char **argv) {
-	uint8_t buffer[65536], crc_buffer[2];
-	char *infile = NULL, *outfile = NULL;
-	int x, length, file_amount, file_size, total_read, total_write, source;
-	int verbose = 0, dib_zero = 0, append_header = 0, overwrite = 0, remove_header = 0, header_sides = 0, total_sides = 0, rc = 0, dest = 0;
+	uint8_t buffer[QD_LENGTH], crc_buffer[2];
 	uint16_t crc_read, crc_calc;
+	char *infile = NULL, *outfile = NULL;
+	unsigned char file_amount, boot_read_file_code, source;
+	unsigned char header_sides = 0, total_sides = 0, rc = 0, dest = 0;
+	unsigned char verbose = 0, O_dib_zero = 0, O_append_header = 0, O_overwrite = 0, O_remove_header = 0, O_correct_crc;
+	unsigned short file_size;
+	unsigned int length, total_read, total_write;
 	const uint8_t fds_header[17] = "FDS\x1a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 	const uint8_t bios_string[16] = "\x01*NINTENDO-HVC*";
 
-	for (x = 1; x < argc; x++) {
+	for (unsigned short x = 1; x < argc; x++) {
 		if (strncmp(argv[x], "-", 1) == 0)
 			for (unsigned int y = 1; y < strlen(argv[x]); y++) {
 				switch (argv[x][y]) {
 				case 'a':
-					append_header = 1;
+					O_append_header = 1;
+					break;
+				case 'c':
+					O_correct_crc = 1;
 					break;
 				case 'o':
-					overwrite = 1;
+					O_overwrite = 1;
 					break;
 				case 'r':
-					remove_header = 1;
+					O_remove_header = 1;
 					break;
 				case 'z':
-					dib_zero = 1;
+					O_dib_zero = 1;
 					break;
 				default:
 					usage(argv[0]);
@@ -163,88 +165,87 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	if (append_header && remove_header) {
+	if (!infile)
+		usage(argv[0]);
+
+	if (O_append_header && O_remove_header) {
 		printf("Can't add header if no header specified\n");
 		usage(argv[0]);
 	}
-
-	if (!infile)
-		usage(argv[0]);
 
 	if (!outfile)
 		verbose = 1;
 
 	fin = fopen(infile, "rb");
 	if (!fin) {
-		printf("FATAL: could not open infile \"%s\"\n", infile);
+		fprintf(stderr, "ERROR: could not open infile \"%s\"\n", infile);
 		bailout();
 	}
 	fseek(fin, 0L, SEEK_END);
 	length = ftell(fin);
 	rewind(fin);
-	if (length % 65536 == 0) {
+	if (length % QD_LENGTH == 0) {
 		source = QD;
 		if (verbose)
-			printf("Source is in QD format\n");
-		if (append_header) {
-			printf("ERROR: Cannot append FDS header, source is QD\n");
+			printf("Image is in QD format\n");
+		if (O_append_header) {
+			fprintf(stderr, "ERROR: Cannot append FDS header, source is QD\n");
 			bailout();
 		}
 	}
-	else if (length % 65500 == 0 || length % 65500 == 16) {
+	else if (length % FDS_LENGTH == 0 || length % FDS_LENGTH == 16) {
 		source = FDS;
 		if (verbose)
-			printf("Source is in FDS format\n");
+			printf("Image is in FDS format\n");
 	}
 	else {
-		printf("FATAL: infile \"%s\" not in qd/fds format\n", infile);
+		fprintf(stderr, "ERROR: infile \"%s\" not in qd/fds format\n", infile);
 		bailout();
 	}
 
 	if (outfile)
-		if (source == QD || append_header || remove_header)
+		if ((source == QD && !O_correct_crc) || O_append_header || O_remove_header)
 			dest = FDS;
 		else
 			dest = QD;
 
-	if (dest == FDS && dib_zero) {
-		printf("FATAL: cannot zero dib crc for fds outfile\n");
+	if (dest == FDS && O_dib_zero) {
+		fprintf(stderr, "ERROR: cannot zero dib crc for fds outfile\n");
 		bailout();
 	}
 
+	if (O_correct_crc && (source == FDS || dest == FDS)) {
+		fprintf(stderr, "ERROR: cannot correct crcs for fds infile or outfile\n");
+	}
+
 	if (outfile) {
-		if (!overwrite) {
+		if (!O_overwrite) {
 			fout = fopen(outfile, "r");
 			if (fout) {
-				printf("FATAL: outfile \"%s\" exists (see -o)\n", outfile);
+				fprintf(stderr, "ERROR: outfile \"%s\" exists (see -o)\n", outfile);
 				bailout();
 			}
 		}
 		fout = fopen(outfile, "wb");
 		if (!fout) {
-			printf("FATAL: could not open outfile \"%s\" for write\n", outfile);
+			fprintf(stderr, "ERROR: could not open outfile \"%s\" for write\n", outfile);
 			bailout();
-		}
-		if (dest == FDS && !append_header && !remove_header) {
-			fwrite(fds_header, 16, 1, fout);
-			if (verbose)
-				printf("Wrote FDS header\n");
 		}
 	}
 	else {
-		if (append_header) {
-			printf("FATAL: adding header requires outfile\n");
+		if (O_append_header) {
+			fprintf(stderr, "ERROR: adding header requires outfile\n");
 			bailout();
 		}
-		if (overwrite) {
-			printf("FATAL: cannot overwrite if no outfile\n");
+		if (O_overwrite) {
+			fprintf(stderr, "ERROR: cannot overwrite if no outfile\n");
 			bailout();
 		}
 	}
 
 	if (source == FDS) {
 		if (!fread(buffer, 16, 1, fin)) {
-			printf("FATAL: fread failure for fds header\n");
+			fprintf(stderr, "ERROR: fread failure for fds header\n");
 			bailout();
 		}
 		if (memcmp(buffer, fds_header, 4) == 0 && memcmp(buffer + 5, fds_header + 5, 11) == 0) {
@@ -256,23 +257,19 @@ int main(int argc, char **argv) {
 					printf("s");
 				printf("\n");
 			}
-			if (append_header) {
-				if (verbose)
-					printf("Copying header\n");
-				fwrite(buffer, 16, 1, fout);
-			}
 		}
 		else {
 			// assume no FDS header
 			rewind(fin);
 			if (verbose)
 				printf("No FDS header found\n");
-			if (append_header) {
-				if (verbose)
-					printf("Writing new header\n");
-				fwrite(fds_header, 16, 1, fout);
-			}
 		}
+	}
+
+	if (dest == FDS && !O_remove_header) {
+		if (verbose)
+			printf("Writing FDS header\n");
+		fwrite(fds_header, 16, 1, fout);
 	}
 
 	while (fread(buffer, 56, 1, fin)) {
@@ -288,7 +285,7 @@ int main(int argc, char **argv) {
 		// disk verification
 		total_read = 56;
 		if (memcmp(buffer, bios_string, 15) != 0) {
-			printf("FATAL: bios string invalid at offset 0x%X\n", total_read - 56);
+			fprintf(stderr, "ERROR: bios string invalid at offset 0x%X\n", total_read - 56);
 			bailout();
 		}
 		if (dest) {
@@ -297,14 +294,14 @@ int main(int argc, char **argv) {
 		}
 		if (source == QD) {
 			if (!fread(crc_buffer, 2, 1, fin)) {
-				printf("FATAL: fread failure for block 1 crc\n");
+				fprintf(stderr, "ERROR: fread failure for block 1 crc\n");
 				bailout();
 			}
 			total_read += 2;
 			crc_read = (crc_buffer[1] * 256) + crc_buffer[0];
 			crc_calc = gen_qd_crc(buffer, 56);
 			// Nintendo sometimes uses a null CRC for the disk info block
-			if (crc_read != crc_calc && crc_read != 0x0000) {
+			if (crc_read != crc_calc && crc_read != 0) {
 				if (verbose)
 					printf("  ");
 				printf("WARNING: CRC mismatch at offset 0x%X, read 0x%02X%02X, expected 0x%02X%02X\n", total_read - 2, crc_read % 256, crc_read / 256, crc_calc % 256, crc_calc / 256);
@@ -312,7 +309,7 @@ int main(int argc, char **argv) {
 			}
 		}
 		if (dest == QD) {
-			if (dib_zero) {
+			if (O_dib_zero) {
 				fputc(0, fout);
 				fputc(0, fout);
 			}
@@ -454,7 +451,7 @@ int main(int argc, char **argv) {
 			}
 			printf("\n");
 			printf("  Game name: ");
-			for (x = 0; x < 3; x++) {
+			for (unsigned short x = 0; x < 3; x++) {
 				if (buffer[16 + x] < 0x20 || buffer[16 + x] > 0x7E)
 					printf("?");
 				else
@@ -462,6 +459,7 @@ int main(int argc, char **argv) {
 			}
 			printf("\n");
 			printf("  Game type: ");
+			// TODO: undocumented values 0x00, 0x31, 0x44, 046, 0x49, 0x4B, 0xFF
 			switch (buffer[19]) {
 			case 0x20:
 				printf("Normal disk");
@@ -501,10 +499,12 @@ int main(int argc, char **argv) {
 				printf("<unknown> (0x%02X)", buffer[23]);
 			}
 			printf("\n");
-			printf("  Boot read file code: %d\n", buffer[25]);
+			boot_read_file_code = buffer[25];
+			printf("  Boot read file code: $%02X/%d\n", boot_read_file_code, boot_read_file_code);
 			printf("  Manufacturing date: ");
 			print_date(buffer + 31);
 			printf("  Country code: ");
+			// TODO: undocumented values: 0x00 (unspecified?), 0x4F, 0xFF
 			switch (buffer[34]) {
 			case 0x49:
 				printf("Japan");
@@ -516,23 +516,19 @@ int main(int argc, char **argv) {
 			printf("\n");
 			printf("  \"Rewritten disk\" date (speculative): ");
 			print_date(buffer + 44);
-			printf("  Disk writer serial number: ");
-			// BUG: this needs to be fixed, no idea what the format is
-			printf("\n");
-			//      printf("%.*s\n", 2, buffer+49);a
-			// BUG: The below is in BCD format, but is it packed or unpacked?
-			printf("  Disk rewrite count: %d\n", buffer[52]);
+			// TODO: Is disk writer serial number hex, dec, or BCD?
+			printf("  Disk writer serial number: %02X%02X\n", buffer[49], buffer[50]);
+			printf("  Disk rewrite count: %x\n", buffer[52]);
 			printf("  Actual disk side: ");
-			if (buffer[53] == 0x00)
+			if (buffer[53] == 0)
 				printf("Side A");
 			else
 				printf("Side B");
 			printf("\n");
 			printf("  Price: ");
-			if (buffer[52] == 0x00)
+			if (buffer[52] == 0)
 				// new/original disk
-				// known but undocumented codes: 0x00, 0x02, 0x04, 0x05, 0x07, 0x10
-				// other new codes (on rewrite?): 0xFF, 0xF7, 0x11, 0x04 (rewrite), 0x03 (rewrite - but with peripherals?)
+				// TODO: undocumented values: 0x00 (unspecified?), 0x02, 0x04, 0x05, 0x07, 0x10, 0xF7, 0xFF
 				switch (buffer[55]) {
 				case 0x01:
 					printf("3400 yen");
@@ -545,6 +541,7 @@ int main(int argc, char **argv) {
 				}
 			else
 				// rewritten disk
+                // TODO: undocumented values: 0x00 (unspecified?), 0x02, 0x03, 0x05, 0x11, 0xFF
 				switch (buffer[55]) {
 				case 0x00:
 					printf("500 yen");
@@ -560,12 +557,12 @@ int main(int argc, char **argv) {
 
 		// file amount block (block 2)   
 		if (!fread(buffer, 2, 1, fin)) {
-			printf("FATAL: fread failure for block 2\n");
+			fprintf(stderr, "ERROR: fread failure for block 2\n");
 			bailout();
 		}
 		total_read += 2;
-		if (buffer[0] != 0x02) {
-			printf("FATAL: invalid file amount block at offset 0x%X\n", total_read - 2);
+		if (buffer[0] != 2) {
+			fprintf(stderr, "ERROR: invalid file amount block at offset 0x%X\n", total_read - 2);
 			bailout();
 		}
 		if (dest) {
@@ -578,7 +575,7 @@ int main(int argc, char **argv) {
 
 		if (source == QD) {
 			if (!fread(crc_buffer, 2, 1, fin)) {
-				printf("FATAL: fread failure for block 2 crc\n");
+				fprintf(stderr, "ERROR: fread failure for block 2 crc\n");
 				bailout();
 			}
 			total_read += 2;
@@ -599,7 +596,7 @@ int main(int argc, char **argv) {
 
 		while (fread(buffer, 16, 1, fin)) {
 			// file header block (block 3)
-			if (buffer[0] != 0x03) {
+			if (buffer[0] != 3) {
 				fseek(fin, -16L, SEEK_CUR);
 				break;
 			}
@@ -612,7 +609,7 @@ int main(int argc, char **argv) {
 
 			if (source == QD) {
 				if (!fread(crc_buffer, 2, 1, fin)) {
-					printf("FATAL: fread failure for block 3 crc\n");
+					fprintf(stderr, "ERROR: fread failure for block 3 crc\n");
 					bailout();
 				}
 				total_read += 2;
@@ -636,9 +633,12 @@ int main(int argc, char **argv) {
 				if (buffer[1] >= file_amount)
 					printf(" (hidden)");
 				printf("\n");
-				printf("    File indicate code: %d\n", buffer[2]);
+				printf("    File indicate code: $%02X/%d", buffer[2], buffer[2]);
+				if (buffer[2] <= boot_read_file_code)
+					printf(" (boot file)");
+				printf("\n");
 				printf("    File name: ");
-				for (x = 0; x < 3; x++) {
+				for (unsigned short x = 0; x < 3; x++) {
 					if (buffer[3 + x] < 0x20 || buffer[3 + x] > 0x7E)
 						printf("?");
 					else
@@ -648,6 +648,7 @@ int main(int argc, char **argv) {
 				printf("    File address: $%04X\n", (buffer[12] * 256) + buffer[11]);
 				printf("    File size: %d bytes\n", file_size);
 				printf("    File kind: ");
+				// TODO: undocumented value: 0x10 from Tantei Jinguuji Saburou - Kikenna Futari (1988)(Data East Corp.)
 				switch (buffer[15]) {
 				case 0:
 					printf("Program (PRAM)");
@@ -666,12 +667,12 @@ int main(int argc, char **argv) {
 
 			// file data block (block 4)
 			if (!fread(buffer, 1 + file_size, 1, fin)) {
-				printf("FATAL: fread failure for block 4\n");
+				fprintf(stderr, "ERROR: fread failure for block 4\n");
 				bailout();
 			}
 			total_read += 1 + file_size;
-			if (buffer[0] != 0x04) {
-				printf("FATAL: invalid file data block at offset 0x%X\n", total_read - (1 + file_size));
+			if (buffer[0] != 4) {
+				fprintf(stderr, "ERROR: invalid file data block at offset 0x%X\n", total_read - (1 + file_size));
 				bailout();
 			}
 			if (dest) {
@@ -681,7 +682,7 @@ int main(int argc, char **argv) {
 
 			if (source == QD) {
 				if (!fread(crc_buffer, 2, 1, fin)) {
-					printf("FATAL: fread failure for block 4 crc\n");
+					fprintf(stderr, "ERROR: fread failure for block 4 crc\n");
 					bailout();
 				}
 				total_read += 2;
@@ -701,33 +702,22 @@ int main(int argc, char **argv) {
 			}
 		}
 
-		if (source == QD) {
-			if (!fread(buffer, 65536 - total_read, 1, fin)) { // read to end
-				printf("FATAL: fread failure for end of side\n");
-				bailout();
-			}
-			if (dest) {
-				for (x = 0; x < 65500 - total_write; x++)
-					fputc(0, fout);
-				if (!remove_header && !header_sides) {
-					fseek(fout, 4L, SEEK_SET);
-					fputc(total_sides, fout);
-				}
-			}
+		// read to end
+		if (!fread(buffer, (source == QD ? QD_LENGTH : FDS_LENGTH) - total_read, 1, fin)) {
+			// TODO: Indicate which disk and side
+			fprintf(stderr, "ERROR: fread failure for end of side\n");
+			bailout();
 		}
-		else {
-			if (!fread(buffer, 65500 - total_read, 1, fin)) { // read to end
-				printf("FATAL: fread failure for end of side\n");
-				bailout();
-			}
-			if (dest)
-				if (dest == QD)
-					for (x = 0; x < 65536 - total_write; x++)
-						fputc(0, fout);
-				else
-					for (x = 0; x < 65500 - total_write; x++)
-						fputc(0, fout);
+		if (dest) {
+			for (unsigned short x = 0; x < (dest == QD ? QD_LENGTH : FDS_LENGTH) - total_write; x++)
+				fputc(0, fout);
 		}
+
+	}
+
+	if (dest == FDS && !O_remove_header) {
+		fseek(fout, 4L, SEEK_SET);
+		fputc(total_sides, fout);
 	}
 
 	if (header_sides && (header_sides != total_sides)) {
